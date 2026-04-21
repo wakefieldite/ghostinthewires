@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# gitw-setup-secureboot: enroll custom Secure Boot keys via sbctl.
+#
+# This is THE step that defeats evil-maid attacks at the ESP level. Without
+# this, an attacker with physical access could replace your GRUB binary.
+# With this, the firmware refuses to boot anything not signed with YOUR keys.
+#
+# Prerequisite: firmware must be in Secure Boot "Setup Mode" (no PK enrolled).
+# Enter firmware setup, delete/clear all keys, save and reboot into Linux.
+
+set -o pipefail
+[[ $EUID -eq 0 ]] || { echo "Run as root."; exit 1; }
+
+if ! pacman -Q sbctl &>/dev/null; then
+  echo "Installing sbctl..."
+  pacman -S --noconfirm sbctl
+fi
+
+# Check Setup Mode
+if ! sbctl status | grep -q 'Setup Mode:.*Enabled'; then
+  cat <<EOF
+Secure Boot is NOT in Setup Mode. To proceed:
+
+  1. Reboot, enter firmware setup (usually F2/F10/DEL during POST).
+  2. Find Secure Boot settings.
+  3. Clear / delete / erase all keys, or switch to "Setup Mode" / "Custom".
+  4. Save and exit.
+  5. Boot back into ghostinthewires-arch.
+  6. Re-run this script.
+
+Current sbctl status:
+EOF
+  sbctl status
+  exit 1
+fi
+
+echo "Creating your own Secure Boot keys..."
+sbctl create-keys
+
+echo "Enrolling keys into firmware (includes Microsoft vendor keys for firmware compatibility)..."
+sbctl enroll-keys --microsoft
+
+echo "Signing currently installed bootloader and kernel..."
+sbctl sign -s /boot/grub/x86_64-efi/core.efi 2>/dev/null || true
+sbctl sign -s /efi/EFI/GRUB/grubx64.efi 2>/dev/null || true
+sbctl sign -s /boot/EFI/GRUB/grubx64.efi 2>/dev/null || true
+sbctl sign -s /boot/vmlinuz-linux
+# If ghostinthewires-arch used systemd-boot, sign those too
+sbctl sign -s /boot/EFI/systemd/systemd-bootx64.efi 2>/dev/null || true
+sbctl sign -s /efi/EFI/systemd/systemd-bootx64.efi  2>/dev/null || true
+
+echo "Verifying signatures..."
+sbctl verify
+
+cat <<EOF
+
+Secure Boot keys enrolled and bootloader/kernel signed.
+
+NEXT:
+  1. Reboot.
+  2. Enter firmware setup, ENABLE Secure Boot (it should now trust your keys).
+  3. Save and boot.
+
+Pacman will auto-sign new kernels via the sbctl pacman hook. No manual work
+needed on updates.
+
+After Secure Boot is active, your TPM2 PCR 7 will include Secure Boot state.
+You'll need to re-enroll the TPM2 keyslot once:
+    sudo gitw-unlock-mode reenroll-tpm
+EOF

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# gitw-apparmor: enable or disable AppArmor.
+# Requires reboot to take effect (AppArmor needs to be active at early boot).
+
+set -o pipefail
+[[ $EUID -eq 0 ]] || { echo "Run as root."; exit 1; }
+
+FEATURES=/etc/gitw/features.conf
+
+case "${1:-}" in
+  enable)
+    sed -i 's/^APPARMOR=.*/APPARMOR=1/' "$FEATURES"
+    systemctl enable apparmor.service
+    /usr/local/bin/gitw-reconfigure
+    echo "AppArmor enabled. Reboot to activate."
+    echo "After reboot, if an app breaks, check: sudo journalctl -k | grep -i apparmor"
+    ;;
+  disable)
+    sed -i 's/^APPARMOR=.*/APPARMOR=0/' "$FEATURES"
+    systemctl disable apparmor.service
+    /usr/local/bin/gitw-reconfigure
+    echo "AppArmor disabled. Reboot to deactivate."
+    ;;
+  status)
+    if aa-status &>/dev/null; then
+      aa-status
+    else
+      echo "AppArmor not active."
+    fi
+    ;;
+  *)
+    echo "Usage: gitw-apparmor <enable|disable|status>"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# gitw-enable-chaotic-aur: add the Chaotic-AUR repository for pre-built
+# AUR packages.
+#
+# Chaotic-AUR builds many popular AUR packages and serves them as a binary
+# repo, so you don't need to compile them yourself. Useful for things like
+# librewolf-bin (if you prefer native over Flatpak) and a bunch of other
+# common AUR tools.
+#
+# This is community-maintained, not official Arch. Use at your own judgment.
+
+set -o pipefail
+[[ $EUID -eq 0 ]] || { echo "Run as root."; exit 1; }
+
+if grep -q '^\[chaotic-aur\]' /etc/pacman.conf; then
+  echo "Chaotic-AUR is already enabled."
+  exit 0
+fi
+
+cat <<'EOF'
+This will add Chaotic-AUR (community-maintained binary repo for popular AUR
+packages). Adds one signing key and one mirrorlist, appends a [chaotic-aur]
+section to /etc/pacman.conf.
+
+Website: https://aur.chaotic.cx/
+EOF
+
+read -rp "Proceed? [y/N] " yn
+[[ $yn =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+
+# Key fingerprint as published by Chaotic-AUR.
+KEY_ID="3056513887B78AEB"
+
+pacman-key --recv-key "$KEY_ID" --keyserver keyserver.ubuntu.com || \
+  { echo "Could not fetch key"; exit 1; }
+pacman-key --lsign-key "$KEY_ID"
+
+pacman -U --noconfirm \
+  'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
+  'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
+  || { echo "Keyring/mirrorlist install failed"; exit 1; }
+
+# Append repo to pacman.conf if not already present
+if ! grep -q '^\[chaotic-aur\]' /etc/pacman.conf; then
+  cat >> /etc/pacman.conf <<'EOF'
+
+[chaotic-aur]
+Include = /etc/pacman.d/chaotic-mirrorlist
+EOF
+fi
+
+pacman -Sy
+
+echo "Chaotic-AUR enabled."
+echo "Browse available packages: pacman -Sl chaotic-aur | less"

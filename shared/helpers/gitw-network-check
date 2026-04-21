@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# gitw-network-check: show LAN/WAN/DNS state and do a speedtest.
+set -o pipefail
+
+GREEN=$'\033[0;32m'; RED=$'\033[0;31m'; RESET=$'\033[0m'
+info() { echo -e "${GREEN}$*${RESET}"; }
+bad()  { echo -e "${RED}$*${RESET}"; }
+
+iface=$(ip route | awk '/^default/ {print $5; exit}')
+lan_ip=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {print $2; exit}')
+gateway=$(ip route | awk '/^default/ {print $3; exit}')
+
+echo "Interface:    ${iface:-none}"
+echo "LAN IP:       ${lan_ip:-none}"
+echo "Gateway:      ${gateway:-none}"
+echo "DNS:"
+awk '/^nameserver/ {print "              " $2}' /etc/resolv.conf 2>/dev/null || echo "              (none)"
+
+if ping -c 1 -W 3 1.1.1.1 &>/dev/null; then
+  info "Internet: OK"
+  wan=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || echo unknown)
+  echo "WAN IP:       $wan"
+else
+  bad "Internet: FAILED"
+fi
+
+echo -n "DNS resolve test (example.com): "
+if getent hosts example.com &>/dev/null; then
+  info "OK"
+else
+  bad "FAILED"
+fi
+
+if command -v curl &>/dev/null; then
+  echo -n "Speed test (download, 10s max): "
+  speed=$(curl -so /dev/null -w '%{speed_download}' --max-time 10 \
+    https://speed.cloudflare.com/__down?bytes=50000000 2>/dev/null | \
+    awk '{printf "%.1f Mbit/s", $1*8/1000000}')
+  echo "${speed:-timeout}"
+fi

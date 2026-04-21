@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# gitw-reconfigure: apply /etc/gitw/features.conf changes to kernel cmdline.
+set -o pipefail
+[[ $EUID -eq 0 ]] || { echo "Run as root."; exit 1; }
+
+FEATURES=/etc/gitw/features.conf
+[[ -f $FEATURES ]] || { echo "No $FEATURES found."; exit 1; }
+# shellcheck disable=SC1090
+source "$FEATURES"
+
+params=()
+[[ -n $LOCKDOWN      ]] && params+=("lockdown=$LOCKDOWN")
+(( INIT_ON_ALLOC      )) && params+=("init_on_alloc=1")
+(( INIT_ON_FREE       )) && params+=("init_on_free=1")
+(( SLAB_NOMERGE       )) && params+=("slab_nomerge")
+(( RANDOMIZE_KSTACK   )) && params+=("randomize_kstack_offset=on")
+(( VSYSCALL_NONE      )) && params+=("vsyscall=none")
+(( DEBUGFS_OFF        )) && params+=("debugfs=off")
+[[ -n $MITIGATIONS    ]] && params+=("mitigations=$MITIGATIONS")
+params+=("page_alloc.shuffle=1" "oops=panic")
+if (( APPARMOR )); then
+  params+=("lsm=landlock,lockdown,yama,integrity,apparmor,bpf" "apparmor=1" "security=apparmor")
+fi
+
+current=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | cut -d'"' -f2)
+base=$(echo "$current" | sed -E 's/(loglevel=[0-9]+ quiet).*/\1/')
+new="$base ${params[*]}"
+
+sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"$new\"|" /etc/default/grub
+echo "New cmdline: $new"
+grub-mkconfig -o /boot/grub/grub.cfg
+mkinitcpio -P
+echo "Done. Reboot to apply."

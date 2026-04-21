@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# gitw-firewall: manage per-machine firewall exceptions.
+#
+# The default firewall denies all inbound except responses to outbound traffic.
+# Use this to selectively open ports (e.g. SSH for remote troubleshooting).
+#
+# SSH is the single largest inbound attack surface on a workstation. Do NOT
+# enable it permanently unless you need it. Enable when troubleshooting,
+# disable when done.
+
+set -o pipefail
+[[ $EUID -eq 0 ]] || { echo "Run as root."; exit 1; }
+
+NFT_DIR=/etc/nftables.d
+
+reload() {
+  if ! nft -c -f /etc/nftables.conf; then
+    echo "nftables config failed validation - refusing to reload" >&2
+    exit 1
+  fi
+  systemctl reload nftables.service
+}
+
+usage() {
+  cat <<EOF
+Usage: gitw-firewall <command> [args]
+
+Commands:
+  status              Show current ruleset
+  allow-ssh [CIDR]    Allow SSH inbound, optionally from a specific CIDR
+                      (e.g. gitw-firewall allow-ssh 192.168.1.0/24)
+  deny-ssh            Remove SSH rule
+  allow-port <p/proto> [CIDR]
+                      Allow arbitrary inbound port (e.g. 8080/tcp)
+  deny-port <p/proto>
+                      Remove port rule
+  list-exceptions     Show active per-machine exceptions
+
+Exceptions live in /etc/nftables.d/*.conf and survive reboots.
+EOF
+}
+
+case "${1:-}" in
+  status)
+    nft list ruleset
+    ;;
+  allow-ssh)
+    cidr=${2:-}
+    if [[ -n $cidr ]]; then
+      echo "# SSH allowed from $cidr"        >  "$NFT_DIR/10-ssh.conf"
+      echo "ip saddr $cidr tcp dport 22 accept" >> "$NFT_DIR/10-ssh.conf"
+    else
+      echo "# SSH allowed from anywhere (RISKY)" >  "$NFT_DIR/10-ssh.conf"
+      echo "tcp dport 22 accept"                 >> "$NFT_DIR/10-ssh.conf"
+      echo "WARNING: SSH allowed from ANY source. Prefer restricting to a CIDR." >&2
+      echo "         Use: sudo gitw-firewall allow-ssh 192.168.1.0/24" >&2
+    fi
+    reload
+    echo "SSH inbound allowed. Don't forget to: systemctl enable --now sshd"
+    echo "When done, disable with: sudo gitw-firewall deny-ssh"
+    ;;
+  deny-ssh)
+    rm -f "$NFT_DIR/10-ssh.conf"
+    reload
+    echo "SSH rule removed."
+    ;;
+  allow-port)
+    spec=${2:-}
+    cidr=${3:-}
+    [[ $spec =~ ^[0-9]+/(tcp|udp)$ ]] || { echo "Bad spec, use PORT/tcp or PORT/udp"; exit 1; }
+    port=${spec%/*}; proto=${spec##*/}
+    file="$NFT_DIR/20-port-${port}-${proto}.conf"
+    if [[ -n $cidr ]]; then
+      echo "ip saddr $cidr $proto dport $port accept" > "$file"
+    else
+      echo "$proto dport $port accept" > "$file"
+    fi
+    reload
+    echo "Port $port/$proto allowed."
+    ;;
+  deny-port)
+    spec=${2:-}
+    [[ $spec =~ ^[0-9]+/(tcp|udp)$ ]] || { echo "Bad spec"; exit 1; }
+    port=${spec%/*}; proto=${spec##*/}
+    rm -f "$NFT_DIR/20-port-${port}-${proto}.conf"
+    reload
+    echo "Port $port/$proto rule removed."
+    ;;
+  list-exceptions)
+    ls -la "$NFT_DIR" | grep -v placeholder || echo "No exceptions."
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

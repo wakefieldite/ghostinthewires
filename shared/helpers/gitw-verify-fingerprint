@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# gitw-verify-fingerprint: open coveryourtracks.eff.org and amiunique.org
+# in Librewolf and Tor Browser so you can compare fingerprints.
+#
+# The ONLY valid way to evaluate browser privacy tweaks is to measure them.
+# If a tweak makes your score worse, remove it.
+
+set -o pipefail
+
+urls=(
+  "https://coveryourtracks.eff.org/"
+  "https://www.amiunique.org/fingerprint"
+  "https://browserleaks.com/"
+)
+
+cat <<'EOF'
+Fingerprint verification procedure:
+
+  1. Librewolf (default Librewolf config, no extra tweaks):
+     - Open each test site below. Record the uniqueness score / bits.
+     - This is your BASELINE. Do not consider it "bad" - a generic Librewolf
+       user looks like ~15-18 bits of uniqueness, which is the RFP design target.
+
+  2. Tor Browser:
+     - Open each test site. Record the score.
+     - Tor Browser should show significantly less uniqueness because all
+       Tor Browser users present identically.
+
+  3. If you decide to add user.js tweaks to Librewolf, re-test AFTER each tweak.
+     - If uniqueness goes DOWN, the tweak helps.
+     - If uniqueness goes UP, the tweak HURTS. Remove it.
+     - If it stays the same, the tweak is cosmetic; keep only if it serves
+       another purpose (e.g. disabling a feature you don't want).
+
+Test sites:
+EOF
+
+for u in "${urls[@]}"; do echo "  - $u"; done
+echo
+
+read -rp "Open all sites in Librewolf now? [Y/n] " yn
+yn=${yn:-y}
+if [[ $yn =~ ^[Yy]$ ]]; then
+  for u in "${urls[@]}"; do
+    echo "Opening: $u"
+    if command -v flatpak &>/dev/null && flatpak list | grep -q librewolf; then
+      flatpak run io.gitlab.librewolf-community "$u" &
+    else
+      xdg-open "$u" &>/dev/null &
+    fi
+    read -rp "  Recorded score? Press Enter for next URL..." _
+  done
+fi
+
+read -rp "Launch Tor Browser for comparison? [Y/n] " yn
+yn=${yn:-y}
+if [[ $yn =~ ^[Yy]$ ]]; then
+  if command -v flatpak &>/dev/null && flatpak list | grep -q torbrowser; then
+    flatpak run com.github.micahflee.torbrowser-launcher &
+  else
+    command -v torbrowser-launcher &>/dev/null && torbrowser-launcher &
+  fi
+  echo "Open the test URLs manually inside Tor Browser after it launches."
+fi

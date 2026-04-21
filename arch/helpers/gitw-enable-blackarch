@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# gitw-enable-blackarch: add the BlackArch repository as an OPTIONAL source
+# for pen-testing tools. Does NOT install any tools - you use `pacman -S <tool>`
+# as needed.
+#
+# BlackArch ships ~2000+ security tools. Adding it as a repo makes them
+# available via pacman. Installing them all is unnecessary, slow, and pollutes
+# your system; just install what you need, when you need it.
+#
+# Repo ordering: Arch core/extra should take priority over BlackArch so that
+# packages present in both (rare, but possible) prefer the official Arch
+# version. The upstream strap.sh handles this correctly by appending to
+# pacman.conf rather than prepending.
+
+set -o pipefail
+[[ $EUID -eq 0 ]] || { echo "Run as root."; exit 1; }
+
+STRAP_URL="https://blackarch.org/strap.sh"
+STRAP_SHA1_URL="https://blackarch.org/strap.sh.sha1sum"
+
+if grep -q '^\[blackarch\]' /etc/pacman.conf; then
+  echo "BlackArch repository is already enabled."
+  exit 0
+fi
+
+cat <<'EOF'
+This will:
+  - Download the BlackArch bootstrap script from https://blackarch.org
+  - Verify its SHA1 (as provided by BlackArch)
+  - Execute it to install the BlackArch signing key and add the repository
+  - Sync pacman databases
+
+It does NOT install any BlackArch tools. Use `pacman -S <toolname>` after
+this completes to install specific tools (e.g. `pacman -S nmap-scripts-bh`).
+
+To browse tools: https://blackarch.org/tools.html
+To see which category a tool is in: `sudo pacman -Sg | grep blackarch`
+EOF
+
+read -rp "Proceed? [y/N] " yn
+[[ $yn =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+cd "$tmpdir"
+echo "Downloading strap.sh..."
+curl -fsSL -o strap.sh "$STRAP_URL" || { echo "Download failed."; exit 1; }
+curl -fsSL -o strap.sh.sha1 "$STRAP_SHA1_URL" || { echo "SHA1 download failed."; exit 1; }
+
+# strap.sh.sha1 contains "HASH  strap.sh"
+expected=$(awk '{print $1}' strap.sh.sha1)
+actual=$(sha1sum strap.sh | awk '{print $1}')
+
+if [[ "$expected" != "$actual" ]]; then
+  echo "SHA1 mismatch!"
+  echo "Expected: $expected"
+  echo "Actual:   $actual"
+  echo "Refusing to run unverified script."
+  exit 1
+fi
+
+echo "SHA1 verified. Running strap.sh..."
+chmod +x strap.sh
+./strap.sh || { echo "strap.sh failed."; exit 1; }
+
+echo
+echo "BlackArch repository added. To browse tools:"
+echo "  pacman -Sg | grep blackarch     # list all BlackArch groups"
+echo "  pacman -Sl blackarch | less     # list all BlackArch packages"
+echo
+echo "Install a specific tool with: pacman -S <toolname>"
+echo
+echo "To REMOVE the BlackArch repo later:"
+echo "  Edit /etc/pacman.conf and delete the [blackarch] section."

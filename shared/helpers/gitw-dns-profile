@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# gitw-dns-profile: switch between home / travel / offline DNS.
+#
+# home    - Use DHCP-provided DNS (e.g. your Pi-hole on your home network).
+#           Your router/Pi-hole sees your queries; upstream sees your IP.
+# travel  - dnscrypt-proxy on 127.0.0.1 with anonymized DNSCrypt relays.
+#           ISP sees only encrypted traffic. Resolver doesn't see your IP
+#           (relay hides it). Blocklists filter trackers/ads at DNS layer.
+# offline - /etc/hosts only. No external DNS. For use with local services
+#           or when you want to be sure nothing leaks.
+
+set -o pipefail
+[[ $EUID -eq 0 ]] || { echo "Run as root."; exit 1; }
+
+FEATURES=/etc/gitw/features.conf
+
+usage() {
+  cat <<EOF
+Usage: gitw-dns-profile <home|travel|offline|status>
+
+  home    - DHCP DNS (your home Pi-hole / router)
+  travel  - dnscrypt-proxy w/ anonymized upstreams + blocklists
+  offline - /etc/hosts only
+
+Current: $(grep '^DNS_PROFILE=' "$FEATURES" 2>/dev/null | cut -d= -f2)
+EOF
+  exit 0
+}
+
+cmd=${1:-}
+case "$cmd" in
+  home|travel|offline)
+    sed -i "s/^DNS_PROFILE=.*/DNS_PROFILE=$cmd/" "$FEATURES"
+    case "$cmd" in
+      travel)
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        cat > /etc/NetworkManager/conf.d/99-gitw-dns.conf <<EOF
+[main]
+dns=none
+rc-manager=unmanaged
+EOF
+        echo 'nameserver 127.0.0.1' > /etc/resolv.conf
+        chattr +i /etc/resolv.conf 2>/dev/null || true
+        systemctl enable --now dnscrypt-proxy.service
+        systemctl reload NetworkManager 2>/dev/null || systemctl restart NetworkManager
+        ;;
+      home)
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/NetworkManager/conf.d/99-gitw-dns.conf
+        systemctl disable --now dnscrypt-proxy.service 2>/dev/null || true
+        systemctl reload NetworkManager 2>/dev/null || systemctl restart NetworkManager
+        ;;
+      offline)
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        echo '# ghostinthewires-arch offline mode' > /etc/resolv.conf
+        chattr +i /etc/resolv.conf 2>/dev/null || true
+        systemctl disable --now dnscrypt-proxy.service 2>/dev/null || true
+        ;;
+    esac
+    echo "DNS profile set to: $cmd"
+    ;;
+  status|"")
+    usage
+    ;;
+  *)
+    usage
+    ;;
+esac

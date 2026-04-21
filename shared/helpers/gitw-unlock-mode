@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# gitw-unlock-mode: manage LUKS unlock methods.
+#
+# Usage:
+#   gitw-unlock-mode status
+#   gitw-unlock-mode enroll-fido2          Add a FIDO2 key
+#   gitw-unlock-mode remove-fido2 <slot>   Remove a FIDO2 keyslot by number
+#   gitw-unlock-mode reenroll-tpm          After firmware update
+#   gitw-unlock-mode set <simple|tpm-pin|combined>
+#
+# 'combined' mode adds custom initramfs hooks that require TPM state AND
+# FIDO2 touch simultaneously. The stock tpm-pin and FIDO2 keyslots remain
+# as fallbacks.
+
+set -o pipefail
+[[ $EUID -eq 0 ]] || { echo "Run as root."; exit 1; }
+
+# Find the LUKS root partition
+ROOT_UUID=$(findmnt -no UUID /)
+CRYPTDEV=$(cryptsetup status cryptroot 2>/dev/null | awk '/device:/ {print $2}')
+[[ -n $CRYPTDEV ]] || { echo "Could not locate LUKS device for cryptroot."; exit 1; }
+
+usage() {
+  grep '^#' "$0" | sed 's/^# \?//'
+  exit 0
+}
+
+cmd=${1:-status}
+shift || true
+
+case "$cmd" in
+  status)
+    echo "LUKS device: $CRYPTDEV"
+    echo
+    cryptsetup luksDump "$CRYPTDEV" | grep -E '^(Keyslots:|  [0-9]+:|^\s+Type:|^\s+PCRs:|^\s+Credential)' | head -60
+    ;;
+
+  enroll-fido2)
+    echo "Insert your FIDO2 key and press Enter."
+    read -r
+    systemd-cryptenroll \
+      --fido2-device=auto \
+      --fido2-with-client-pin=yes \
+      --fido2-with-user-presence=yes \
+      "$CRYPTDEV"
+    ;;
+
+  remove-fido2)
+    slot=${1:-}
+    [[ -n $slot ]] || { echo "Usage: gitw-unlock-mode remove-fido2 <slot>"; exit 1; }
+    systemd-cryptenroll --wipe-slot="$slot" "$CRYPTDEV"
+    ;;
+
+  reenroll-tpm)
+    echo "Removing existing TPM2 keyslot (if any)..."
+    systemd-cryptenroll --wipe-slot=tpm2 "$CRYPTDEV" || true
+    echo "Enter current LUKS passphrase to authorize re-enrollment."
+    echo "You will also be prompted for a new TPM2 PIN."
+    systemd-cryptenroll \
+      --tpm2-device=auto \
+      --tpm2-pcrs=0+7 \
+      --tpm2-with-pin=yes \
+      "$CRYPTDEV"
+    echo "TPM2 re-enrolled. Reboot to test."
+    ;;
+
+  set)
+    mode=${1:-}
+    case "$mode" in
+      simple)
+        echo "Removing all TPM/FIDO2 keyslots (passphrase keyslot preserved)..."
+        systemd-cryptenroll --wipe-slot=tpm2 "$CRYPTDEV" || true
+        systemd-cryptenroll --wipe-slot=fido2 "$CRYPTDEV" || true
+        echo "Done. Only passphrase unlock remains."
+        ;;
+      tpm-pin)
+        echo "Stock tooling mode: TPM2+PIN and FIDO2+PIN as separate keyslots."
+        echo "(Re-run enroll-fido2 and reenroll-tpm as needed.)"
+        # Remove any combined-mode hooks
+        rm -f /etc/initcpio/install/gitw-combined
+        rm -f /etc/initcpio/hooks/gitw-combined
+        sed -i 's/ gitw-combined//g' /etc/mkinitcpio.conf
+        mkinitcpio -P
+        ;;
+      combined)
+        echo "Combined mode requires the custom mkinitcpio hook."
+        echo "See /usr/share/gitw/combined-hook/ for the hook source."
+        echo "This mode is EXPERIMENTAL. Make sure tpm-pin and FIDO2 keyslots"
+        echo "are enrolled first as fallbacks."
+        read -rp "Install combined hook? [y/N] " yn
+        [[ $yn =~ ^[Yy]$ ]] || exit 0
+        if [[ ! -f /usr/share/gitw/combined-hook/install ]]; then
+          echo "Combined hook source not found. Reinstall ghostinthewires-arch helpers."
+          exit 1
+        fi
+        install -m755 /usr/share/gitw/combined-hook/install /etc/initcpio/install/gitw-combined
+        install -m755 /usr/share/gitw/combined-hook/hook    /etc/initcpio/hooks/gitw-combined
+        # Insert gitw-combined before 'encrypt' in HOOKS
+        sed -i 's/\bencrypt\b/gitw-combined encrypt/' /etc/mkinitcpio.conf
+        mkinitcpio -P
+        echo "Combined hook installed. Test carefully before relying on it."
+        ;;
+      *)
+        usage
+        ;;
+    esac
+    ;;
+
+  -h|--help|help) usage ;;
+  *) usage ;;
+esac

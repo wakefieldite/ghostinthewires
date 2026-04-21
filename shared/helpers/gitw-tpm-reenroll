@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# gitw-tpm-reenroll: re-enroll TPM2 keyslot after firmware/SecureBoot changes.
+#
+# Use cases:
+#   --pre-update   Take a snapshot of current PCR values before firmware update.
+#   (no flag)      Remove old TPM keyslot and enroll new one with current PCRs.
+
+set -o pipefail
+[[ $EUID -eq 0 ]] || { echo "Run as root."; exit 1; }
+
+CRYPTDEV=$(cryptsetup status cryptroot 2>/dev/null | awk '/device:/ {print $2}')
+[[ -n $CRYPTDEV ]] || { echo "Could not locate LUKS device for cryptroot."; exit 1; }
+
+case "${1:-}" in
+  --pre-update)
+    mkdir -p /var/lib/gitw-install
+    systemd-analyze pcrs > /var/lib/gitw-install/pcrs-pre-update.txt 2>/dev/null || \
+      tpm2_pcrread sha256 > /var/lib/gitw-install/pcrs-pre-update.txt 2>/dev/null || \
+      echo "Warning: could not read PCRs."
+    echo "Saved PCR snapshot to /var/lib/gitw-install/pcrs-pre-update.txt"
+    echo "Now apply the firmware update, reboot, and run this script without --pre-update."
+    ;;
+  "")
+    echo "Removing old TPM2 keyslot..."
+    systemd-cryptenroll --wipe-slot=tpm2 "$CRYPTDEV" || true
+    echo "Enter your current LUKS passphrase to authorize re-enrollment."
+    echo "You'll be prompted for a new TPM2 PIN."
+    systemd-cryptenroll \
+      --tpm2-device=auto \
+      --tpm2-pcrs=0+7 \
+      --tpm2-with-pin=yes \
+      "$CRYPTDEV"
+    echo
+    echo "TPM2 re-enrolled. Reboot to verify unlock works."
+    ;;
+  *)
+    echo "Usage: gitw-tpm-reenroll [--pre-update]"
+    exit 1
+    ;;
+esac
