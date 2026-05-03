@@ -13,6 +13,10 @@
 #
 # After reboot: log in as root, run /root/gitw/harden.sh, then as your user
 # run /root/gitw/software.sh.
+#
+# Every settings-applying action emits a verification entry to the log at
+# /tmp/gitw-install.log (during this phase; copied to /mnt/var/log/ at end).
+# See docs/dev/logging.md for log format and review workflow.
 
 set -o pipefail
 
@@ -22,6 +26,7 @@ set -o pipefail
 
 REPO_BASE="${GITW_REPO_BASE:-https://raw.githubusercontent.com/wakefieldite/ghostinthewires/main}"
 SENTINEL_DIR="/mnt/var/lib/gitw-install"
+LOG_LIB_URL="$REPO_BASE/shared/lib/gitw-log.sh"
 
 GREEN=$'\033[0;32m'
 RED=$'\033[0;31m'
@@ -29,6 +34,9 @@ YELLOW=$'\033[1;33m'
 BLUE=$'\033[0;34m'
 BOLD=$'\033[1m'
 RESET=$'\033[0m'
+
+# Log lives on the live ISO during Phase 1, copied to target at end.
+export GITW_LOG="/tmp/gitw-install.log"
 
 # Populated during run:
 declare -g dev_path part_prefix esp_part root_part
@@ -41,7 +49,7 @@ declare -g cpu_vendor="generic"
 declare -g gpu_selection=""
 
 # =============================================================================
-# Logging
+# Console messages (separate from structured log)
 # =============================================================================
 
 die()   { echo -e "${RED}[!] $*${RESET}" >&2; exit 1; }
@@ -57,6 +65,45 @@ confirm() {
   read -rp "$prompt $hint " reply
   reply=${reply:-$default}
   [[ $reply =~ ^[Yy]$ ]]
+}
+
+# =============================================================================
+# Bootstrap the logging library
+# =============================================================================
+
+bootstrap_log_lib() {
+  # During Phase 1 we don't have the lib installed yet; fetch from the repo.
+  local lib=/tmp/gitw-log.sh
+  if ! curl -fsSL "$LOG_LIB_URL" -o "$lib" 2>/dev/null; then
+    warn "Could not fetch logging library from $LOG_LIB_URL."
+    warn "Install will proceed without structured verification logging."
+    # Provide stubs so calls don't error out.
+    gitw_log_init() { :; }
+    gitw_log_step() { :; }
+    gitw_log_info() { :; }
+    gitw_log_action() { :; }
+    gitw_log_warn() { :; }
+    gitw_log_fail() { :; }
+    gitw_log_phase_summary() { echo "(logging library unavailable)"; }
+    gitw_verify_file_contains() { :; }
+    gitw_verify_file_lacks() { :; }
+    gitw_verify_file_mode() { :; }
+    gitw_verify_symlink_target() { :; }
+    gitw_verify_kernel_param() { :; }
+    gitw_verify_service_enabled() { :; }
+    gitw_verify_pacman_pkg() { :; }
+    gitw_verify_sysctl() { :; }
+    gitw_verify_luks_keyslot() { :; }
+    gitw_verify_btrfs_subvolume() { :; }
+    gitw_verify_mount() { :; }
+    gitw_verify_user_groups() { :; }
+    gitw_verify_command() { :; }
+    return
+  fi
+  # shellcheck source=/dev/null
+  source "$lib"
+  gitw_log_init "install"
+  info "Logging to $GITW_LOG"
 }
 
 # =============================================================================
@@ -101,40 +148,51 @@ check_live_iso() {
 }
 
 tune_live_pacman() {
-  # Cosmetic / speed tweaks for the live ISO's pacman (carries into pacstrap).
+  gitw_log_step "live_pacman" "Tuning live ISO pacman config"
   sed -i 's/^#Color/Color/' /etc/pacman.conf
+  gitw_verify_file_contains "Color uncommented in live pacman.conf" \
+    /etc/pacman.conf '^Color'
   sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf
+  gitw_verify_file_contains "VerbosePkgLists uncommented in live pacman.conf" \
+    /etc/pacman.conf '^VerbosePkgLists'
   sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 5/' /etc/pacman.conf
+  gitw_verify_file_contains "ParallelDownloads uncommented in live pacman.conf" \
+    /etc/pacman.conf '^ParallelDownloads = 5'
 }
 
 detect_capabilities() {
   hdr "Detecting hardware capabilities"
+  gitw_log_step "detect_capabilities" "Detecting UEFI/TPM2/Secure-Boot/CPU"
 
   # UEFI?
   if [[ -d /sys/firmware/efi/efivars ]]; then
     has_uefi=1
     info "UEFI firmware detected."
+    gitw_log_info "UEFI=yes"
   else
     has_uefi=0
     warn "BIOS/Legacy firmware detected. Secure Boot and TPM-based unlock"
     warn "will not be available. Installation will use BIOS GRUB + passphrase."
+    gitw_log_info "UEFI=no (BIOS/Legacy)"
   fi
 
   # TPM2?
   if [[ -c /dev/tpmrm0 || -c /dev/tpm0 ]]; then
     if command -v systemd-cryptenroll &>/dev/null; then
-      # Probe whether it's actually a 2.0 TPM
       if systemd-cryptenroll --tpm2-device=list 2>/dev/null | grep -q '^/dev/'; then
         has_tpm2=1
         info "TPM 2.0 detected and accessible."
+        gitw_log_info "TPM2=yes"
       else
         has_tpm2=0
         warn "TPM device present but not usable as TPM 2.0."
+        gitw_log_warn "TPM device present but not TPM2 capable"
       fi
     fi
   else
     has_tpm2=0
     note "No TPM device found. Unlock will rely on passphrase (+ optional FIDO2)."
+    gitw_log_info "TPM2=no"
   fi
 
   # Secure Boot setup-mode?
@@ -143,9 +201,11 @@ detect_capabilities() {
     if bootctl status 2>/dev/null | grep -qi 'setup-mode.*setup'; then
       has_secureboot=1
       info "Secure Boot is in Setup Mode - custom keys can be enrolled."
+      gitw_log_info "SecureBoot=setup-mode"
     elif bootctl status 2>/dev/null | grep -qi 'secure boot.*enabled'; then
       note "Secure Boot is enabled with vendor keys. To use custom keys,"
       note "enter firmware setup, clear keys / enter Setup Mode, then re-run."
+      gitw_log_info "SecureBoot=enabled-vendor"
     fi
   fi
 
@@ -153,12 +213,15 @@ detect_capabilities() {
   if grep -qi 'GenuineIntel' /proc/cpuinfo; then
     cpu_vendor="intel"
     info "Intel CPU detected (intel-ucode)."
+    gitw_log_info "CPU=intel"
   elif grep -qi 'AuthenticAMD' /proc/cpuinfo; then
     cpu_vendor="amd"
     info "AMD CPU detected (amd-ucode)."
+    gitw_log_info "CPU=amd"
   else
     cpu_vendor="generic"
     warn "Unknown CPU vendor; skipping microcode."
+    gitw_log_warn "Unknown CPU vendor; skipping microcode"
   fi
 
   echo
@@ -172,6 +235,7 @@ detect_capabilities() {
 
 network_check() {
   hdr "Network diagnostics"
+  gitw_log_step "network_check" "Verifying network connectivity"
 
   local iface lan_ip gateway wan_ip
   iface=$(ip route | awk '/^default/ {print $5; exit}')
@@ -187,18 +251,18 @@ network_check() {
     awk '/^nameserver/ {print "                  " $2}' /etc/resolv.conf
   fi
 
-  # Connectivity test
   if ping -c 1 -W 3 1.1.1.1 &>/dev/null; then
     wan_ip=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || echo unknown)
     echo "    WAN IP:       $wan_ip"
     info "Internet connectivity: OK"
+    gitw_log_info "Internet OK; iface=$iface lan=$lan_ip gw=$gateway wan=$wan_ip"
   else
     warn "Internet connectivity: FAILED"
     warn "The installer needs network access. Fix with iwctl (Wi-Fi) or check cable."
+    gitw_log_fail "Internet connectivity failed"
     die "No internet. Cannot continue."
   fi
 
-  # Quick speedtest (best-effort, non-fatal)
   if command -v curl &>/dev/null; then
     echo -n "    Speed test:   "
     local speed_mbps
@@ -329,12 +393,12 @@ EOF
 
 partition_and_encrypt() {
   hdr "Partitioning and encryption"
+  gitw_log_step "partition" "Partitioning and creating LUKS container"
   lsblk -o NAME,SIZE,TYPE,MODEL,MOUNTPOINTS
   echo
   read -erp "Target device (e.g. /dev/nvme0n1 or /dev/sda): " dev_path
   [[ -b "$dev_path" ]] || die "Not a block device: $dev_path"
 
-  # Partition-path suffix: nvme/mmcblk/loop use p1, sdX/vdX use just 1
   if [[ "$dev_path" =~ (nvme|mmcblk|loop)[0-9]+n?[0-9]*$ ]]; then
     part_prefix="p"
   else
@@ -345,8 +409,6 @@ partition_and_encrypt() {
   read -rp "Type the device path again to confirm: " confirm_path
   [[ "$confirm_path" == "$dev_path" ]] || die "Confirmation mismatch."
 
-  # Decide encrypted-/boot vs. separate ESP+/boot
-  # Encrypted /boot requires GRUB (not systemd-boot) and works on both UEFI and BIOS.
   if (( has_uefi )); then
     if confirm "Use encrypted /boot? (Recommended, protects kernel/initramfs from tampering)" y; then
       use_encrypted_boot=1
@@ -354,13 +416,11 @@ partition_and_encrypt() {
       use_encrypted_boot=0
     fi
   else
-    # BIOS: encrypted /boot is the only sensible option with GRUB anyway.
     use_encrypted_boot=1
   fi
 
   info "Creating partition table on $dev_path..."
   if (( has_uefi )); then
-    # GPT, ESP (512M) + LUKS container
     parted --script "$dev_path" \
       mklabel gpt \
       mkpart ESP fat32 1MiB 513MiB \
@@ -368,7 +428,6 @@ partition_and_encrypt() {
       mkpart cryptsystem 513MiB 100% \
       || die "parted failed"
   else
-    # MBR, 1M BIOS boot spacer + LUKS container
     parted --script "$dev_path" \
       mklabel msdos \
       mkpart primary 1MiB 100% \
@@ -384,6 +443,8 @@ partition_and_encrypt() {
     root_part="${dev_path}${part_prefix}2"
     info "Formatting ESP at $esp_part..."
     mkfs.fat -F32 -n ESP "$esp_part" || die "mkfs.fat failed"
+    gitw_verify_command "ESP formatted as vfat" 0 \
+      bash -c "blkid -s TYPE -o value '$esp_part' | grep -q vfat"
   else
     esp_part=""
     root_part="${dev_path}${part_prefix}1"
@@ -407,52 +468,34 @@ partition_and_encrypt() {
     --key-file=- \
     "$root_part" || die "luksFormat failed"
 
-  # GRUB 2.12+ supports argon2id directly, so no separate PBKDF2 keyslot needed.
-  # If you see "no key available with this passphrase" at GRUB prompt on older
-  # firmware, add a PBKDF2 keyslot manually post-install:
-  #   echo -n "your-passphrase" > /tmp/k && chmod 600 /tmp/k
-  #   cryptsetup luksAddKey --pbkdf pbkdf2 --key-file=/tmp/k <root-part>
-  #   shred -u /tmp/k
+  gitw_verify_command "LUKS2 container detected" 0 \
+    bash -c "cryptsetup isLuks '$root_part' && cryptsetup luksDump '$root_part' | grep -q 'Version:.*2'"
 
   info "Opening LUKS container..."
   printf '%s' "$encryption_password" | cryptsetup open \
     --type luks --key-file=- "$root_part" cryptroot || die "luksOpen failed"
+
+  gitw_verify_command "/dev/mapper/cryptroot exists" 0 test -b /dev/mapper/cryptroot
 
   cryptsetup status cryptroot
 }
 
 create_btrfs_subvolumes() {
   hdr "Creating Btrfs filesystem and subvolumes"
+  gitw_log_step "btrfs" "Creating Btrfs and subvolumes"
   info "Formatting /dev/mapper/cryptroot as Btrfs..."
   mkfs.btrfs -f -L system /dev/mapper/cryptroot || die "mkfs.btrfs failed"
+  gitw_verify_command "cryptroot formatted as btrfs" 0 \
+    bash -c "blkid -s TYPE -o value /dev/mapper/cryptroot | grep -q btrfs"
 
   mount /dev/mapper/cryptroot /mnt
-  # Subvolume layout follows the ArchWiki recommendation for Snapper + rollback:
-  #
-  # Snapshotted (part of root rollback):
-  #   @           -> /
-  #
-  # NOT snapshotted (survive root rollback):
-  #   @home           -> /home             (user data persists)
-  #   @snapshots      -> /.snapshots       (snapshots themselves)
-  #   @var_log        -> /var/log          (logs survive rollback so you can debug)
-  #   @var_log_audit  -> /var/log/audit    (SIEM-forwardable, isolated from other logs)
-  #   @var_cache      -> /var/cache        (pacman cache, regenerable)
-  #   @var_tmp        -> /var/tmp          (ephemeral by definition)
-  #
-  # Additional subvolumes (created but left UNMOUNTED unless explicitly wanted):
-  #   @var_lib_docker -> would mount at /var/lib/docker with nodatacow for CoW-
-  #                     hostile workloads. We create the subvolume so it's ready
-  #                     but do not add it to fstab - uncomment in /etc/fstab if
-  #                     you install Docker/Podman.
   for sv in @ @home @snapshots @var_log @var_log_audit @var_cache @var_tmp @var_lib_docker; do
     btrfs subvolume create "/mnt/$sv" || die "Failed to create subvolume $sv"
+    gitw_verify_btrfs_subvolume "subvolume $sv created" "/mnt/$sv"
   done
   umount /mnt
 
   info "Mounting subvolumes..."
-  # Detect if the underlying device is rotational. autodefrag helps on HDDs
-  # but causes write amplification on SSDs.
   local rotational=0
   local base_dev
   base_dev=$(lsblk -no PKNAME "$root_part" 2>/dev/null | head -1)
@@ -461,29 +504,33 @@ create_btrfs_subvolumes() {
   fi
   local extra_opts=""
   (( rotational )) && extra_opts=",autodefrag"
+  gitw_log_info "rotational=$rotational extra_mount_opts='$extra_opts'"
 
   local mopts="rw,noatime,compress=zstd:3,space_cache=v2,discard=async${extra_opts}"
-  # Note on discard=async: safe on encrypted Btrfs (kernel 5.6+). If your threat
-  # model forbids any TRIM leakage (e.g. hiding used-sector count from a
-  # forensic examiner), change to "nodiscard" here and in fstab post-install.
 
   mount -o "$mopts,subvol=@" /dev/mapper/cryptroot /mnt
+  gitw_verify_mount "@ mounted at /mnt" /mnt btrfs
   mkdir -p /mnt/{home,.snapshots,var/log/audit,var/cache,var/tmp,boot,efi,proc,sys,dev,run}
   mount -o "$mopts,subvol=@home"          /dev/mapper/cryptroot /mnt/home
+  gitw_verify_mount "@home mounted" /mnt/home btrfs
   mount -o "$mopts,subvol=@snapshots"     /dev/mapper/cryptroot /mnt/.snapshots
+  gitw_verify_mount "@snapshots mounted" /mnt/.snapshots btrfs
   mount -o "$mopts,subvol=@var_log"       /dev/mapper/cryptroot /mnt/var/log
+  gitw_verify_mount "@var_log mounted" /mnt/var/log btrfs
   mount -o "$mopts,subvol=@var_log_audit" /dev/mapper/cryptroot /mnt/var/log/audit
+  gitw_verify_mount "@var_log_audit mounted" /mnt/var/log/audit btrfs
   mount -o "$mopts,subvol=@var_cache"     /dev/mapper/cryptroot /mnt/var/cache
+  gitw_verify_mount "@var_cache mounted" /mnt/var/cache btrfs
   mount -o "rw,noatime,subvol=@var_tmp"   /dev/mapper/cryptroot /mnt/var/tmp
-  # @var_lib_docker created but intentionally not mounted here.
+  gitw_verify_mount "@var_tmp mounted" /mnt/var/tmp btrfs
 
   if (( has_uefi )); then
     if (( use_encrypted_boot )); then
-      # /boot is inside LUKS (as a dir on @), /efi is the ESP
       mount "$esp_part" /mnt/efi
+      gitw_verify_mount "ESP mounted at /efi (encrypted /boot mode)" /mnt/efi vfat
     else
-      # /boot IS the ESP
       mount "$esp_part" /mnt/boot
+      gitw_verify_mount "ESP mounted at /boot" /mnt/boot vfat
     fi
   fi
 }
@@ -494,68 +541,72 @@ create_btrfs_subvolumes() {
 
 run_reflector() {
   hdr "Optimizing mirror list"
+  gitw_log_step "reflector" "Refreshing pacman mirror list"
   if ! command -v reflector &>/dev/null; then
     pacman -Sy --noconfirm reflector || warn "Reflector install failed, continuing with default mirrors."
   fi
   if command -v reflector &>/dev/null; then
     info "Ranking mirrors (this takes ~30 seconds)..."
-    reflector --protocol https --latest 20 --sort rate \
-      --save /etc/pacman.d/mirrorlist || warn "Reflector failed, using existing mirrors."
+    if reflector --protocol https --latest 20 --sort rate \
+        --save /etc/pacman.d/mirrorlist; then
+      gitw_verify_file_contains "mirror list refreshed" \
+        /etc/pacman.d/mirrorlist '^Server = https'
+    else
+      gitw_log_warn "Reflector failed; using existing mirrors"
+    fi
   fi
 }
 
 pacstrap_base() {
   hdr "Installing base system (pacstrap)"
+  gitw_log_step "pacstrap" "Installing base packages to /mnt"
 
   local pkgs=(
-    # Core
     base base-devel linux linux-firmware linux-headers
     btrfs-progs cryptsetup
-    # Boot
     grub efibootmgr
-    # Filesystem tools
     dosfstools e2fsprogs
-    # Network (NetworkManager + wireguard + openvpn integration)
     networkmanager networkmanager-openvpn
     wireguard-tools openvpn
-    # Firewall (native nftables)
     nftables
-    # Snapshots
     snapper snap-pac
-    # Editors / basics
     vim nano sudo
-    # Firmware updates
     fwupd
-    # Diagnostics
     usbutils pciutils lshw dmidecode
-    # Man pages
     man-db man-pages texinfo
-    # Zram
     zram-generator
-    # Reflector (keep installed for periodic mirror refresh)
     reflector
   )
 
-  # Microcode
   case "$cpu_vendor" in
     intel) pkgs+=(intel-ucode) ;;
     amd)   pkgs+=(amd-ucode) ;;
   esac
 
-  # TPM2 tooling
   if (( has_tpm2 )); then
     pkgs+=(tpm2-tools tpm2-tss)
   fi
 
-  # FIDO2 tooling
   pkgs+=(libfido2)
-
-  # grub-btrfs for snapshot boot menu entries
   pkgs+=(grub-btrfs inotify-tools)
 
   pacstrap -K /mnt "${pkgs[@]}" || die "pacstrap failed"
 
+  # Verify a representative sample of packages installed correctly
+  for p in base linux cryptsetup btrfs-progs grub networkmanager nftables snapper; do
+    gitw_verify_pacman_pkg "package $p installed" "$p" /mnt
+  done
+  case "$cpu_vendor" in
+    intel) gitw_verify_pacman_pkg "intel-ucode installed" intel-ucode /mnt ;;
+    amd)   gitw_verify_pacman_pkg "amd-ucode installed"   amd-ucode   /mnt ;;
+  esac
+  if (( has_tpm2 )); then
+    gitw_verify_pacman_pkg "tpm2-tools installed" tpm2-tools /mnt
+  fi
+
   genfstab -U /mnt >> /mnt/etc/fstab
+  gitw_verify_file_contains "fstab populated with cryptroot mount" \
+    /mnt/etc/fstab 'subvol=/@'
 }
 
 # =============================================================================
@@ -564,7 +615,11 @@ pacstrap_base() {
 
 configure_system_basics() {
   hdr "Configuring system basics (timezone, locale, hostname)"
+  gitw_log_step "system_basics" "Setting timezone, locale, hostname, NM"
+
   arch-chroot /mnt ln -sf "/usr/share/zoneinfo/$timezone_choice" /etc/localtime
+  gitw_verify_symlink_target "timezone symlink set" \
+    "/mnt/etc/localtime" "/usr/share/zoneinfo/$timezone_choice"
   arch-chroot /mnt hwclock --systohc
 
   cat > /mnt/etc/locale.gen <<'EOF'
@@ -572,40 +627,59 @@ en_US.UTF-8 UTF-8
 EOF
   arch-chroot /mnt locale-gen
   echo "LANG=en_US.UTF-8" > /mnt/etc/locale.conf
+  gitw_verify_file_contains "locale.conf set to en_US.UTF-8" \
+    /mnt/etc/locale.conf 'LANG=en_US\.UTF-8'
 
   echo "$hostname" > /mnt/etc/hostname
+  gitw_verify_file_contains "hostname written" /mnt/etc/hostname "^${hostname}\$"
   cat > /mnt/etc/hosts <<EOF
 127.0.0.1   localhost
 ::1         localhost
 127.0.1.1   $hostname.localdomain $hostname
 EOF
+  gitw_verify_file_contains "hosts contains hostname mapping" \
+    /mnt/etc/hosts "127.0.1.1.*${hostname}"
 
-  # NetworkManager: we'll configure it fully in harden.sh. Just enable now.
   arch-chroot /mnt systemctl enable NetworkManager.service
+  gitw_verify_service_enabled "NetworkManager enabled" NetworkManager.service /mnt
 
-  # Tune target pacman: Color, VerbosePkgLists, ParallelDownloads
   sed -i 's/^#Color/Color/' /mnt/etc/pacman.conf
+  gitw_verify_file_contains "target pacman Color enabled" \
+    /mnt/etc/pacman.conf '^Color'
   sed -i 's/^#VerbosePkgLists/VerbosePkgLists/' /mnt/etc/pacman.conf
+  gitw_verify_file_contains "target pacman VerbosePkgLists enabled" \
+    /mnt/etc/pacman.conf '^VerbosePkgLists'
   sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 5/' /mnt/etc/pacman.conf
+  gitw_verify_file_contains "target pacman ParallelDownloads enabled" \
+    /mnt/etc/pacman.conf '^ParallelDownloads = 5'
 
-  # Zram swap: 50% of RAM, zstd compression, no disk swap
   cat > /mnt/etc/systemd/zram-generator.conf <<'EOF'
 [zram0]
 zram-size = min(ram / 2, 8192)
 compression-algorithm = zstd
 EOF
+  gitw_verify_file_contains "zram-generator config written" \
+    /mnt/etc/systemd/zram-generator.conf 'zram-size'
 }
 
 set_passwords_and_user() {
   hdr "Setting passwords and creating user"
+  gitw_log_step "user_setup" "Creating user and setting passwords"
+
   echo "root:$root_password" | arch-chroot /mnt chpasswd
 
   arch-chroot /mnt useradd -m -G wheel,audio,video,input -s /bin/bash "$username"
   echo "$username:$user_password" | arch-chroot /mnt chpasswd
 
-  # Enable wheel group sudo
+  gitw_verify_user_groups "user created with expected groups" \
+    "$username" "wheel,audio,video,input" /mnt
+
   echo '%wheel ALL=(ALL:ALL) ALL' > /mnt/etc/sudoers.d/10-wheel
   chmod 0440 /mnt/etc/sudoers.d/10-wheel
+  gitw_verify_file_contains "wheel group sudo enabled" \
+    /mnt/etc/sudoers.d/10-wheel '%wheel ALL'
+  gitw_verify_file_mode "sudoers fragment mode 0440" \
+    /mnt/etc/sudoers.d/10-wheel "0440"
 }
 
 # =============================================================================
@@ -614,69 +688,69 @@ set_passwords_and_user() {
 
 configure_mkinitcpio() {
   hdr "Configuring mkinitcpio"
+  gitw_log_step "mkinitcpio" "Setting HOOKS and MODULES, generating initramfs"
 
-  # HOOKS order for LUKS + Btrfs with GRUB's encrypt hook:
-  #   base udev autodetect microcode modconf kms keyboard keymap consolefont
-  #   block encrypt filesystems fsck
-  #
-  # Key points:
-  #   - keyboard MUST precede encrypt (you need to type the passphrase)
-  #   - encrypt MUST precede filesystems (the FS is inside the LUKS container)
-  #   - microcode hook loads CPU ucode early (Arch 2024+ standard)
-  #   - No btrfs hook needed unless using multi-device Btrfs
   arch-chroot /mnt sed -i \
     's/^HOOKS=.*/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block encrypt filesystems fsck)/' \
     /etc/mkinitcpio.conf
+  gitw_verify_file_contains "HOOKS line includes encrypt before filesystems" \
+    /mnt/etc/mkinitcpio.conf 'HOOKS=.*encrypt.*filesystems'
+  gitw_verify_file_contains "HOOKS line has keyboard before encrypt" \
+    /mnt/etc/mkinitcpio.conf 'HOOKS=.*keyboard.*encrypt'
 
-  # Add a MODULES line for Btrfs so it's available in early userspace
   arch-chroot /mnt sed -i 's/^MODULES=.*/MODULES=(btrfs)/' /etc/mkinitcpio.conf
+  gitw_verify_file_contains "MODULES line set to btrfs" \
+    /mnt/etc/mkinitcpio.conf 'MODULES=\(btrfs\)'
 
   arch-chroot /mnt mkinitcpio -P || die "mkinitcpio failed"
+  gitw_verify_command "initramfs file present" 0 \
+    test -f /mnt/boot/initramfs-linux.img
 }
 
 create_crypttab() {
   hdr "Creating /etc/crypttab"
+  gitw_log_step "crypttab" "Writing /etc/crypttab header"
   local uuid
   uuid=$(blkid -s UUID -o value "$root_part")
   [[ -n $uuid ]] || die "Could not read UUID of $root_part"
-  # The initramfs handles the root device via kernel cmdline, so this crypttab
-  # entry is for any non-root LUKS devices (none in this setup). We leave it
-  # empty-with-header so the user can add more later.
   cat > /mnt/etc/crypttab <<EOF
 # <name>       <device>         <password>    <options>
 # cryptroot is unlocked by the initramfs via kernel cmdline, not this file.
 EOF
-  # But we do need crypttab.initramfs if we want systemd's unlock to work -
-  # since we're using the classic encrypt hook (not sd-encrypt), we don't.
+  gitw_verify_file_contains "crypttab placeholder written" \
+    /mnt/etc/crypttab '^# <name>'
 }
 
 install_grub() {
   hdr "Installing GRUB bootloader"
+  gitw_log_step "grub" "Installing and configuring GRUB"
   local uuid
   uuid=$(blkid -s UUID -o value "$root_part")
 
-  # Base GRUB_CMDLINE_LINUX: encrypted root
   local cmdline="cryptdevice=UUID=$uuid:cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@"
-
-  # Quiet boot + reasonable defaults (hardening params are added in harden.sh)
   local cmdline_default="loglevel=3 quiet"
 
   arch-chroot /mnt sed -i \
     "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"$cmdline\"|" \
     /etc/default/grub
+  gitw_verify_file_contains "GRUB_CMDLINE_LINUX has cryptdevice param" \
+    /mnt/etc/default/grub "GRUB_CMDLINE_LINUX=.*cryptdevice=UUID="
+
   arch-chroot /mnt sed -i \
     "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"$cmdline_default\"|" \
     /etc/default/grub
+  gitw_verify_file_contains "GRUB_CMDLINE_LINUX_DEFAULT set" \
+    /mnt/etc/default/grub 'GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"'
 
   if (( use_encrypted_boot )); then
-    # GRUB needs to unlock LUKS itself to read the kernel
     arch-chroot /mnt sed -i 's|^#\?GRUB_ENABLE_CRYPTODISK=.*|GRUB_ENABLE_CRYPTODISK=y|' /etc/default/grub
     if ! grep -q '^GRUB_ENABLE_CRYPTODISK=' /mnt/etc/default/grub; then
       echo 'GRUB_ENABLE_CRYPTODISK=y' >> /mnt/etc/default/grub
     fi
+    gitw_verify_file_contains "GRUB_ENABLE_CRYPTODISK=y set" \
+      /mnt/etc/default/grub '^GRUB_ENABLE_CRYPTODISK=y'
   fi
 
-  # Install GRUB
   if (( has_uefi )); then
     local efi_dir=/boot
     (( use_encrypted_boot )) && efi_dir=/efi
@@ -686,6 +760,8 @@ install_grub() {
       --bootloader-id=GRUB \
       --modules="part_gpt part_msdos cryptodisk luks2 gcry_rijndael gcry_sha512 btrfs" \
       || die "grub-install (UEFI) failed"
+    gitw_verify_command "GRUB EFI binary present" 0 \
+      test -f "/mnt${efi_dir}/EFI/GRUB/grubx64.efi"
   else
     arch-chroot /mnt grub-install \
       --target=i386-pc \
@@ -695,6 +771,9 @@ install_grub() {
   fi
 
   arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg || die "grub-mkconfig failed"
+  gitw_verify_command "grub.cfg generated" 0 test -f /mnt/boot/grub/grub.cfg
+  gitw_verify_file_contains "grub.cfg references cryptdevice" \
+    /mnt/boot/grub/grub.cfg "cryptdevice=UUID="
 }
 
 # =============================================================================
@@ -704,6 +783,7 @@ install_grub() {
 enroll_tpm2() {
   (( has_tpm2 )) || return 0
   hdr "Enrolling TPM2 keyslot"
+  gitw_log_step "tpm2_enroll" "Enrolling TPM2+PIN keyslot"
 
   note "Binding to PCRs 0 (firmware) and 7 (Secure Boot state)."
   note "Kernel/initramfs updates will NOT break this. Firmware updates WILL."
@@ -711,22 +791,6 @@ enroll_tpm2() {
   note "    sudo gitw-unlock-mode reenroll-tpm"
   echo
 
-  # We write the passphrase to a temp file so systemd-cryptenroll can read it
-  # without prompting. The file lives briefly on tmpfs.
-  local tmpkey
-  tmpkey=$(mktemp /tmp/gitw-luks-key.XXXXXX)
-  chmod 600 "$tmpkey"
-  printf '%s' "$encryption_password" > "$tmpkey"
-
-  # Pass the PIN via environment
-  NEWPIN="$tmpkey"
-  local tpm_pin_file
-  tpm_pin_file=$(mktemp /tmp/gitw-tpm-pin.XXXXXX)
-  chmod 600 "$tpm_pin_file"
-  printf '%s' "$tpm2_pin" > "$tpm_pin_file"
-
-  # systemd-cryptenroll reads existing passphrase from PASSWORD env
-  # and new PIN from NEWPIN env (as of systemd 254+)
   if PASSWORD="$encryption_password" NEWPIN="$tpm2_pin" \
      systemd-cryptenroll \
       --tpm2-device=auto \
@@ -734,11 +798,12 @@ enroll_tpm2() {
       --tpm2-with-pin=yes \
       "$root_part"; then
     info "TPM2 keyslot enrolled."
+    gitw_verify_command "TPM2 token present in luksDump" 0 \
+      bash -c "cryptsetup luksDump '$root_part' | grep -q 'systemd-tpm2'"
   else
     warn "TPM2 enrollment failed. Passphrase keyslot still works."
+    gitw_log_fail "TPM2 enrollment via systemd-cryptenroll returned non-zero"
   fi
-
-  shred -u "$tmpkey" "$tpm_pin_file" 2>/dev/null || rm -f "$tmpkey" "$tpm_pin_file"
 }
 
 enroll_fido2_key() {
@@ -762,8 +827,12 @@ enroll_fido2_key() {
 enroll_fido2_keys() {
   (( enroll_fido2_primary )) || return 0
   hdr "Enrolling FIDO2 keys"
+  gitw_log_step "fido2_enroll" "Enrolling FIDO2 key(s)"
 
-  enroll_fido2_key "primary" || true
+  if enroll_fido2_key "primary"; then
+    gitw_verify_command "FIDO2 token present in luksDump (after primary)" 0 \
+      bash -c "cryptsetup luksDump '$root_part' | grep -q 'systemd-fido2'"
+  fi
 
   if (( enroll_fido2_backup )); then
     echo
@@ -780,24 +849,14 @@ enroll_fido2_keys() {
 
 configure_snapper() {
   hdr "Configuring Snapper for Btrfs snapshots"
-
-  # Our @snapshots subvolume is already mounted at /.snapshots. Snapper's
-  # create-config will try to create its own .snapshots subvolume, which
-  # would conflict. The clean way: unmount ours, let snapper create its
-  # config (which needs a writable /.snapshots dir, not necessarily its
-  # own subvolume), then remount ours on top.
+  gitw_log_step "snapper" "Configuring Snapper + grub-btrfs"
 
   umount /mnt/.snapshots || warn "umount /mnt/.snapshots failed"
-
-  # snapper create-config requires /.snapshots to NOT exist (it creates it).
-  # Remove the empty mount point.
   rmdir /mnt/.snapshots 2>/dev/null || true
 
   arch-chroot /mnt snapper --no-dbus -c root create-config / || \
     warn "snapper create-config failed (non-fatal)"
 
-  # Snapper created @/.snapshots as a nested subvolume. Remove it and put
-  # our @snapshots subvolume back in its place.
   if arch-chroot /mnt btrfs subvolume show /.snapshots &>/dev/null; then
     arch-chroot /mnt btrfs subvolume delete /.snapshots || \
       warn "Could not delete snapper's nested .snapshots"
@@ -805,11 +864,11 @@ configure_snapper() {
   mkdir -p /mnt/.snapshots
   mount -o "rw,noatime,compress=zstd:3,space_cache=v2,discard=async,subvol=@snapshots" \
     /dev/mapper/cryptroot /mnt/.snapshots
+  gitw_verify_mount "@snapshots remounted at /mnt/.snapshots" /mnt/.snapshots btrfs
 
   arch-chroot /mnt chmod 750 /.snapshots
   arch-chroot /mnt chown :wheel /.snapshots
 
-  # Snapper config tuning
   local cfg=/mnt/etc/snapper/configs/root
   if [[ -f $cfg ]]; then
     sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="yes"/' "$cfg"
@@ -818,11 +877,23 @@ configure_snapper() {
     sed -i 's/^TIMELINE_LIMIT_WEEKLY=.*/TIMELINE_LIMIT_WEEKLY="2"/' "$cfg"
     sed -i 's/^TIMELINE_LIMIT_MONTHLY=.*/TIMELINE_LIMIT_MONTHLY="0"/' "$cfg"
     sed -i 's/^TIMELINE_LIMIT_YEARLY=.*/TIMELINE_LIMIT_YEARLY="0"/' "$cfg"
+    gitw_verify_file_contains "snapper TIMELINE_CREATE=yes" \
+      "$cfg" '^TIMELINE_CREATE="yes"'
+    gitw_verify_file_contains "snapper TIMELINE_LIMIT_HOURLY=5" \
+      "$cfg" '^TIMELINE_LIMIT_HOURLY="5"'
+  else
+    gitw_log_fail "snapper config /etc/snapper/configs/root not created"
   fi
 
   arch-chroot /mnt systemctl enable snapper-timeline.timer
+  gitw_verify_service_enabled "snapper-timeline.timer enabled" \
+    snapper-timeline.timer /mnt
   arch-chroot /mnt systemctl enable snapper-cleanup.timer
+  gitw_verify_service_enabled "snapper-cleanup.timer enabled" \
+    snapper-cleanup.timer /mnt
   arch-chroot /mnt systemctl enable grub-btrfsd.service
+  gitw_verify_service_enabled "grub-btrfsd.service enabled" \
+    grub-btrfsd.service /mnt
 }
 
 # =============================================================================
@@ -831,25 +902,34 @@ configure_snapper() {
 
 stage_next_phases() {
   hdr "Staging harden.sh and software.sh"
-  mkdir -p /mnt/root/gitw/helpers
+  gitw_log_step "stage_next" "Fetching phase 2/3 scripts and helpers"
+  mkdir -p /mnt/root/gitw/helpers /mnt/usr/local/lib/gitw
 
-  # Monorepo layout: Arch files live under /arch/, shared helpers under
-  # /shared/helpers/. REPO_BASE points at the raw repo root.
+  # Stage the logging library to a stable system path so harden.sh and
+  # software.sh can source it without re-fetching.
+  if curl -fsSL "$REPO_BASE/shared/lib/gitw-log.sh" -o /mnt/usr/local/lib/gitw/gitw-log.sh 2>/dev/null; then
+    chmod 0644 /mnt/usr/local/lib/gitw/gitw-log.sh
+    gitw_verify_file_contains "logging library staged" \
+      /mnt/usr/local/lib/gitw/gitw-log.sh '_GITW_LOG_LOADED'
+  else
+    gitw_log_fail "Could not fetch logging library"
+  fi
+
   local arch_files=(harden.sh software.sh)
   for f in "${arch_files[@]}"; do
     if curl -fsSL "$REPO_BASE/arch/$f" -o "/mnt/root/gitw/$f" 2>/dev/null; then
       info "Fetched arch/$f"
+      gitw_verify_command "$f staged at /root/gitw" 0 \
+        test -s "/mnt/root/gitw/$f"
     else
-      warn "Could not fetch arch/$f from $REPO_BASE"
+      gitw_log_fail "Could not fetch arch/$f from $REPO_BASE"
     fi
   done
 
-  # Top-level README.md
   if curl -fsSL "$REPO_BASE/README.md" -o "/mnt/root/gitw/README.md" 2>/dev/null; then
     info "Fetched README.md"
   fi
 
-  # Shared helpers (distro-neutral)
   local shared_helpers=(
     gitw-reconfigure gitw-unlock-mode gitw-dns-profile
     gitw-firewall gitw-apparmor gitw-setup-secureboot
@@ -861,7 +941,6 @@ stage_next_phases() {
     fi
   done
 
-  # Arch-specific helpers
   local arch_helpers=(
     gitw-enable-blackarch gitw-enable-chaotic-aur gitw-aur-review
   )
@@ -879,8 +958,11 @@ stage_next_phases() {
 # =============================================================================
 
 write_sentinel() {
+  gitw_log_step "sentinel" "Writing phase-1 sentinel"
   mkdir -p "$SENTINEL_DIR"
   date -u +%FT%TZ > "$SENTINEL_DIR/phase-1-install.done"
+  gitw_verify_command "phase-1 sentinel exists" 0 \
+    test -s "$SENTINEL_DIR/phase-1-install.done"
   cat > "$SENTINEL_DIR/install-summary.txt" <<EOF
 Install completed: $(date -u +%FT%TZ)
 Target device:    $dev_path
@@ -897,15 +979,25 @@ EOF
 
 verify_install() {
   hdr "Verifying install"
-  [[ -f /mnt/boot/grub/grub.cfg ]]       || die "grub.cfg missing"
-  [[ -f /mnt/boot/initramfs-linux.img ]] || die "initramfs-linux.img missing"
-  [[ -f /mnt/etc/fstab ]]                || die "fstab missing"
-  [[ -f /mnt/etc/locale.conf ]]          || die "locale.conf missing"
-  info "All critical files present."
+  gitw_log_step "verify_install" "Final critical-file checks"
+  gitw_verify_command "grub.cfg present" 0 test -f /mnt/boot/grub/grub.cfg
+  gitw_verify_command "initramfs present" 0 test -f /mnt/boot/initramfs-linux.img
+  gitw_verify_command "fstab present"     0 test -f /mnt/etc/fstab
+  gitw_verify_command "locale.conf present" 0 test -f /mnt/etc/locale.conf
+}
+
+copy_log_to_target() {
+  # Copy the phase-1 log to the target so phase-2/3 can append to it.
+  mkdir -p /mnt/var/log
+  if [[ -f $GITW_LOG ]]; then
+    cp "$GITW_LOG" /mnt/var/log/gitw-install.log
+    chmod 0600 /mnt/var/log/gitw-install.log
+  fi
 }
 
 safely_unmount() {
   hdr "Unmounting and closing LUKS"
+  copy_log_to_target
   sync
   umount -R /mnt || warn "umount -R failed (continuing)"
   cryptsetup close cryptroot || warn "cryptsetup close failed"
@@ -940,6 +1032,9 @@ EOF
   fi
   echo "  If all else fails, use the long LUKS passphrase."
   echo
+  note "Validation log copied to /var/log/gitw-install.log on the target."
+  note "Review with:  awk -F'\\t' '\$7 != \"ok\" && \$7 != \"info\"' /var/log/gitw-install.log"
+  echo
   note "If unlock surprises happen, it's almost always because Secure Boot state"
   note "or firmware changed. Use the passphrase and read:"
   note "    /root/gitw/README.md  (Troubleshooting)"
@@ -954,6 +1049,7 @@ main() {
   greet
   check_root
   check_live_iso
+  bootstrap_log_lib
   tune_live_pacman
   detect_capabilities
   network_check
@@ -986,6 +1082,9 @@ main() {
   stage_next_phases
   write_sentinel
   verify_install
+
+  gitw_log_phase_summary
+
   safely_unmount
   final_message
 }
